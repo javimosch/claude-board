@@ -1,0 +1,172 @@
+#!/usr/bin/env bun
+
+import Database from 'bun:sqlite';
+import { randomUUID } from 'crypto';
+import { createInterface } from 'readline';
+
+// Connect to the same database
+const db = new Database('claude-sessions.db');
+
+// Password hashing (matching the server implementation)
+async function hashPassword(password: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(password + 'salt');
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function generatePassword(): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%';
+  let password = '';
+  for (let i = 0; i < 24; i++) {
+    password += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return password;
+}
+
+async function createUser(username: string, password: string, role: 'admin' | 'developer', projectIds: string[] = []): Promise<void> {
+  // Check if user already exists
+  const existingStmt = db.prepare(`SELECT id FROM users WHERE username = ?`);
+  if (existingStmt.get(username)) {
+    console.error(`✗ User "${username}" already exists`);
+    process.exit(1);
+  }
+
+  // Hash password and create user
+  const userId = randomUUID();
+  const now = Date.now();
+  const passwordHash = await hashPassword(password);
+
+  const insertStmt = db.prepare(`
+    INSERT INTO users (id, username, password_hash, role, created_at, created_by, is_active)
+    VALUES (?, ?, ?, ?, ?, ?, 1)
+  `);
+
+  try {
+    insertStmt.run(userId, username, passwordHash, role, now, 'admin');
+    console.log(`✓ User created: ${username}`);
+    console.log(`✓ Password: ${password}`);
+
+    // Grant project access if specified
+    if (projectIds.length > 0) {
+      const grantStmt = db.prepare(`
+        INSERT OR IGNORE INTO user_project_access (id, user_id, project_id, granted_at, granted_by)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+
+      for (const projectId of projectIds) {
+        grantStmt.run(randomUUID(), userId, projectId, now, 'admin');
+      }
+      console.log(`✓ Projects: ${projectIds.join(', ')}`);
+    } else {
+      console.log(`⚠ No projects granted. User can be granted access later.`);
+    }
+
+    console.log(`\nShare these credentials with the user:\n`);
+    console.log(`  Username: ${username}`);
+    console.log(`  Password: ${password}`);
+    if (projectIds.length > 0) {
+      console.log(`  Role: ${role}`);
+      console.log(`  Projects: ${projectIds.join(', ')}`);
+    }
+  } catch (e) {
+    console.error(`✗ Failed to create user: ${e}`);
+    process.exit(1);
+  }
+}
+
+async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+
+  // Support CLI arguments: create-user <username> [password] [role] [projectNumbers...]
+  if (args.length > 0) {
+    const username = args[0];
+    const password = args[1] || generatePassword();
+    const role = (args[2] || 'developer') as 'admin' | 'developer';
+    const projectNumbers = args.slice(3).map(Number).filter((n) => !isNaN(n));
+
+    // Get projects and convert numbers to IDs
+    const projectsStmt = db.prepare(`SELECT id FROM projects ORDER BY last_used DESC`);
+    const projectsFromDb = projectsStmt.all() as any[];
+    const projectIds = projectNumbers
+      .filter((num) => num > 0 && num <= projectsFromDb.length)
+      .map((num) => projectsFromDb[num - 1].id);
+
+    await createUser(username, password, role, projectIds);
+    return;
+  }
+
+  // Interactive mode
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  const question = (prompt: string): Promise<string> => {
+    return new Promise((resolve) => {
+      rl.question(prompt, resolve);
+    });
+  };
+
+  try {
+    console.log('\n🔐 Create New User\n');
+
+    const username = await question('Username: ');
+    if (!username.trim()) {
+      console.error('✗ Username is required');
+      rl.close();
+      process.exit(1);
+    }
+
+    const roleInput = await question('Role (admin/developer) [developer]: ');
+    const role = (roleInput.trim() || 'developer') as 'admin' | 'developer';
+
+    const passwordInput = await question('Password (press Enter for random): ');
+    const password = passwordInput.trim() || generatePassword();
+
+    // Get and display projects
+    const projectsStmt = db.prepare(`SELECT id, name, cwd FROM projects ORDER BY last_used DESC`);
+    const projects = projectsStmt.all() as any[];
+
+    let projectIds: string[] = [];
+    if (projects.length > 0) {
+      console.log('\nAvailable projects:');
+      projects.forEach((p, idx) => {
+        console.log(`  ${idx + 1}. ${p.name} (${p.cwd})`);
+      });
+
+      const projectInput = await question('\nSelect project numbers (comma-separated, or press Enter to skip): ');
+      const numbers = projectInput
+        .trim()
+        .split(',')
+        .map((n) => parseInt(n.trim()))
+        .filter((n) => !isNaN(n) && n > 0 && n <= projects.length);
+
+      projectIds = numbers.map((num) => projects[num - 1].id);
+
+      if (projectIds.length > 0) {
+        console.log(`\n✓ Selected projects: ${projectIds.map((id) => projects.find((p) => p.id === id)?.name).join(', ')}`);
+      }
+    } else {
+      console.log('\n⚠ No projects exist yet. Create some projects in the UI first.');
+    }
+
+    // Close readline before creating user
+    rl.close();
+
+    // Create user and wait for completion
+    await createUser(username, password, role, projectIds);
+
+    // Force exit after a short delay to ensure all output is flushed
+    setTimeout(() => {
+      process.exit(0);
+    }, 100);
+  } catch (e) {
+    rl.close();
+    console.error(`✗ Error: ${e}`);
+    process.exit(1);
+  }
+}
+
+main().catch(console.error);

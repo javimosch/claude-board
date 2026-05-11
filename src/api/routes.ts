@@ -1,9 +1,11 @@
 import { Hono } from 'hono';
 import { randomUUID } from 'crypto';
 import { db } from '../lib/db';
-import { getCurrentUser } from '../services/session';
+import { getCurrentUser, requireAdmin } from '../services/session';
 import { getProject, getProjects, createProject, updateProject, deleteProject, getProjectStatuses, createProjectStatus, renameProjectStatus, updateStatusPositions, deleteProjectStatusWithMigration, updateSessionStatus, getSessionsByProjectAndStatus } from '../services/project';
 import { saveSessionToDb, loadSessionFromDb, updateSessionName, deleteSessionFromDb, getSessionHistory } from '../lib/db';
+import { listUsers, getUserById, createUser, deleteUser, grantProjectAccess, revokeProjectAccess, getProjectUsers } from '../services/user';
+import { hashPassword } from '../lib/auth';
 
 // Re-exported from server.ts context (sessions map and claude executor)
 export function registerProjectRoutes(app: Hono, sessions: Map<any, any>, executeClaudeWithStreaming: Function, getIndexHtml: () => string) {
@@ -252,6 +254,179 @@ export function registerSessionRoutes(app: Hono, sessions: Map<any, any>) {
       return c.json({ success: true, sessionId, newStatus });
     } catch (e) {
       return c.json({ error: `${e}` }, 400);
+    }
+  });
+}
+
+export function registerAdminRoutes(app: Hono) {
+  // GET /api/admin/users - List all active users with project count
+  app.get('/api/admin/users', (c) => {
+    const session = getCurrentUser(c);
+    if (!requireAdmin(session, c)) {
+      return c.json({ error: 'Unauthorized' }, 403);
+    }
+
+    try {
+      const users = listUsers();
+      const usersWithProjects = users.map(user => {
+        const projectAccess = db.prepare(`
+          SELECT project_id FROM user_project_access WHERE user_id = ?
+        `).all(user.id) as any[];
+        const projectIds = projectAccess.map(p => p.project_id);
+        return {
+          id: user.id,
+          username: user.username,
+          role: user.role,
+          created_at: user.created_at,
+          created_by: user.created_by,
+          last_login: user.last_login,
+          project_count: projectIds.length,
+          projectIds: projectIds
+        };
+      });
+      return c.json({ users: usersWithProjects });
+    } catch (e) {
+      return c.json({ error: `Failed to list users: ${e}` }, 400);
+    }
+  });
+
+  // POST /api/admin/users - Create new user
+  app.post('/api/admin/users', async (c) => {
+    const session = getCurrentUser(c);
+    if (!requireAdmin(session, c)) {
+      return c.json({ error: 'Unauthorized' }, 403);
+    }
+
+    try {
+      const { username, password, role = 'developer', projectIds = [] } = await c.req.json<{
+        username: string;
+        password: string;
+        role?: 'admin' | 'developer';
+        projectIds?: string[];
+      }>();
+
+      if (!username?.trim() || !password?.trim()) {
+        return c.json({ error: 'Username and password are required' }, 400);
+      }
+
+      if (role !== 'admin' && role !== 'developer') {
+        return c.json({ error: 'Role must be admin or developer' }, 400);
+      }
+
+      // Check if username already exists
+      const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+      if (existing) {
+        return c.json({ error: 'Username already exists' }, 400);
+      }
+
+      const newUser = await createUser(username.trim(), password.trim(), role, session.userId);
+
+      // Grant project access
+      for (const projectId of projectIds) {
+        grantProjectAccess(newUser.id, projectId, session.userId);
+      }
+
+      return c.json({
+        success: true,
+        userId: newUser.id,
+        username: newUser.username,
+        role: newUser.role
+      });
+    } catch (e) {
+      return c.json({ error: `Failed to create user: ${e}` }, 400);
+    }
+  });
+
+  // DELETE /api/admin/users/:userId - Soft-delete user
+  app.delete('/api/admin/users/:userId', (c) => {
+    const session = getCurrentUser(c);
+    if (!requireAdmin(session, c)) {
+      return c.json({ error: 'Unauthorized' }, 403);
+    }
+
+    try {
+      const userId = c.req.param('userId');
+      const user = getUserById(userId);
+
+      if (!user) {
+        return c.json({ error: 'User not found' }, 404);
+      }
+
+      deleteUser(userId);
+      return c.json({ success: true });
+    } catch (e) {
+      return c.json({ error: `Failed to delete user: ${e}` }, 400);
+    }
+  });
+
+  // PATCH /api/admin/users/:userId/projects - Update user project access
+  app.patch('/api/admin/users/:userId/projects', async (c) => {
+    const session = getCurrentUser(c);
+    if (!requireAdmin(session, c)) {
+      return c.json({ error: 'Unauthorized' }, 403);
+    }
+
+    try {
+      const userId = c.req.param('userId');
+      const { projectIds = [] } = await c.req.json<{ projectIds: string[] }>();
+
+      const user = getUserById(userId);
+      if (!user) {
+        return c.json({ error: 'User not found' }, 404);
+      }
+
+      // Get current project access
+      const currentAccess = db.prepare(`
+        SELECT project_id FROM user_project_access WHERE user_id = ?
+      `).all(userId) as any[];
+
+      // Remove access for projects not in the new list
+      for (const access of currentAccess) {
+        if (!projectIds.includes(access.project_id)) {
+          revokeProjectAccess(userId, access.project_id);
+        }
+      }
+
+      // Add access for new projects
+      const currentProjectIds = currentAccess.map(a => a.project_id);
+      for (const projectId of projectIds) {
+        if (!currentProjectIds.includes(projectId)) {
+          grantProjectAccess(userId, projectId, session.userId);
+        }
+      }
+
+      return c.json({ success: true, projectIds });
+    } catch (e) {
+      return c.json({ error: `Failed to update projects: ${e}` }, 400);
+    }
+  });
+
+  // PATCH /api/admin/users/:userId/password - Reset user password
+  app.patch('/api/admin/users/:userId/password', async (c) => {
+    const session = getCurrentUser(c);
+    if (!requireAdmin(session, c)) {
+      return c.json({ error: 'Unauthorized' }, 403);
+    }
+
+    try {
+      const userId = c.req.param('userId');
+      const { password } = await c.req.json<{ password: string }>();
+
+      if (!password?.trim()) {
+        return c.json({ error: 'Password is required' }, 400);
+      }
+
+      const user = getUserById(userId);
+      if (!user) {
+        return c.json({ error: 'User not found' }, 404);
+      }
+
+      const passwordHash = await hashPassword(password.trim());
+      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, userId);
+
+      return c.json({ success: true });
+    } catch (e) {
+      return c.json({ error: `Failed to reset password: ${e}` }, 400);
     }
   });
 }

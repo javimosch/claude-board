@@ -15,7 +15,7 @@ import { createProject, getProjects, getProject, updateProject, deleteProject, g
 import { parseJsonlStream } from './services/parser';
 import { KanbanConverter } from './services/kanban';
 import { registerAuthRoutes } from './api/auth';
-import { registerProjectRoutes, registerSessionRoutes } from './api/routes';
+import { registerProjectRoutes, registerSessionRoutes, registerAdminRoutes } from './api/routes';
 import { registerExecutionRoutes } from './api/execution';
 import { registerWebSocketRoute } from './ws/handlers';
 import { executeClaudeWithStreaming, createBroadcaster } from './services/claude';
@@ -91,6 +91,7 @@ const executeWithContext = (prompt: string, sessionId: string, _sessions: any, _
 registerAuthRoutes(app);
 registerProjectRoutes(app, sessions, executeWithContext, getIndexHtml);
 registerSessionRoutes(app, sessions);
+registerAdminRoutes(app);
 registerWebSocketRoute(app, sessions, wsClients);
 registerExecutionRoutes(app, sessions, wsClients, executeWithContext);
 
@@ -1476,6 +1477,381 @@ function getIndexHtml() {
       );
     }
 
+    function UserHeader({ currentUser, onAdminClick, onLogoutClick }) {
+      if (!currentUser) return null;
+      return (
+        <div style={{ background: '#FFFFFF', borderBottom: '1px solid #EAEAEA', padding: '12px 24px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+            <p style={{ fontSize: '0.75rem', color: '#787774', margin: 0, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              {currentUser.username} • {currentUser.role}
+            </p>
+          </div>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            {currentUser.role === 'admin' && (
+              <button
+                onClick={onAdminClick}
+                style={{ background: '#E1F3FE', color: '#1F6C9F', border: '1px solid #EAEAEA', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontSize: '0.75rem', fontWeight: 600 }}
+                onMouseEnter={(e) => e.currentTarget.style.background = '#CEE7F3'}
+                onMouseLeave={(e) => e.currentTarget.style.background = '#E1F3FE'}
+              >
+                Admin Panel
+              </button>
+            )}
+            <button
+              onClick={onLogoutClick}
+              style={{ background: '#FDEBEC', color: '#9F2F2D', border: '1px solid #EAEAEA', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontSize: '0.75rem', fontWeight: 600 }}
+              onMouseEnter={(e) => e.currentTarget.style.background = '#F9D5D7'}
+              onMouseLeave={(e) => e.currentTarget.style.background = '#FDEBEC'}
+            >
+              Logout
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    function AdminUsersPanel({ projects = [], onClose, currentUserId }) {
+      const [users, setUsers] = useState([]);
+      const [loading, setLoading] = useState(true);
+      const [error, setError] = useState(null);
+      const [success, setSuccess] = useState(null);
+      const [showCreateForm, setShowCreateForm] = useState(false);
+      const [newUser, setNewUser] = useState({ username: '', password: '', role: 'developer', projectIds: [] });
+      const [editingUserId, setEditingUserId] = useState(null);
+      const [editingProjects, setEditingProjects] = useState([]);
+
+      // Load users on mount
+      useEffect(() => {
+        loadUsers();
+      }, []);
+
+      const loadUsers = async () => {
+        try {
+          setLoading(true);
+          const resp = await fetch('/api/admin/users');
+          if (!resp.ok) {
+            throw new Error('Failed to load users');
+          }
+          const data = await resp.json();
+          setUsers(data.users || []);
+          setError(null);
+        } catch (e) {
+          setError('Failed to load users: ' + e.message);
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      const handleCreateUser = async () => {
+        if (!newUser.username.trim() || !newUser.password.trim()) {
+          setError('Username and password are required');
+          return;
+        }
+
+        try {
+          const resp = await fetch('/api/admin/users', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              username: newUser.username.trim(),
+              password: newUser.password.trim(),
+              role: newUser.role,
+              projectIds: newUser.projectIds
+            })
+          });
+
+          if (!resp.ok) {
+            const data = await resp.json();
+            throw new Error(data.error || 'Failed to create user');
+          }
+
+          setSuccess('User created successfully!');
+          setTimeout(() => setSuccess(null), 3000);
+          setNewUser({ username: '', password: '', role: 'developer', projectIds: [] });
+          setShowCreateForm(false);
+          await loadUsers();
+        } catch (e) {
+          setError('Failed to create user: ' + e.message);
+        }
+      };
+
+      const handleDeleteUser = async (userId, username) => {
+        if (userId === currentUserId) {
+          setError('Cannot delete your own user account');
+          return;
+        }
+
+        if (!confirm('Delete user "' + username + '"? This cannot be undone.')) {
+          return;
+        }
+
+        try {
+          const resp = await fetch('/api/admin/users/' + userId, {
+            method: 'DELETE'
+          });
+
+          if (!resp.ok) {
+            throw new Error('Failed to delete user');
+          }
+
+          setSuccess('User deleted successfully!');
+          setTimeout(() => setSuccess(null), 3000);
+          await loadUsers();
+        } catch (e) {
+          setError('Failed to delete user: ' + e.message);
+        }
+      };
+
+      const handleEditProjects = (userId) => {
+        const user = users.find(u => u.id === userId);
+        if (user) {
+          setEditingUserId(userId);
+          // Use projectIds from user data returned by API
+          setEditingProjects(user.projectIds || []);
+        }
+      };
+
+      const handleUpdateProjects = async (userId) => {
+        try {
+          const resp = await fetch('/api/admin/users/' + userId + '/projects', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectIds: editingProjects })
+          });
+
+          if (!resp.ok) {
+            throw new Error('Failed to update projects');
+          }
+
+          setSuccess('Projects updated successfully!');
+          setTimeout(() => setSuccess(null), 3000);
+          setEditingUserId(null);
+          await loadUsers();
+        } catch (e) {
+          setError('Failed to update projects: ' + e.message);
+        }
+      };
+
+      const toggleProjectSelection = (projectId) => {
+        setEditingProjects(prev =>
+          prev.includes(projectId)
+            ? prev.filter(id => id !== projectId)
+            : [...prev, projectId]
+        );
+      };
+
+      const formatDate = (timestamp) => {
+        if (!timestamp) return 'Never';
+        return new Date(timestamp).toLocaleDateString();
+      };
+
+      return (
+        <div style={{ display: 'flex', minHeight: '100vh', background: '#FBFBFA', flexDirection: 'column' }}>
+          {/* Header */}
+          <div style={{ background: '#FFFFFF', borderBottom: '1px solid #EAEAEA', padding: '24px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h1 style={{ fontSize: '1.875rem', fontWeight: 700, color: '#111111', margin: 0 }}>
+                User Management
+              </h1>
+              <button
+                onClick={onClose}
+                style={{ background: '#111111', color: '#FFFFFF', border: 'none', padding: '10px 16px', borderRadius: '5px', cursor: 'pointer', fontSize: '0.875rem', fontWeight: 600 }}
+                onMouseEnter={(e) => e.currentTarget.style.background = '#2F3437'}
+                onMouseLeave={(e) => e.currentTarget.style.background = '#111111'}
+              >
+                ← Back
+              </button>
+            </div>
+          </div>
+
+          {/* Content */}
+          <div style={{ flex: 1, padding: '24px', overflow: 'auto', maxWidth: '1200px', margin: '0 auto', width: '100%' }}>
+            {/* Status Messages */}
+            {error && (
+              <div style={{ background: '#FDEBEC', border: '1px solid #EAEAEA', borderRadius: '8px', padding: '12px 16px', marginBottom: '16px', color: '#9F2F2D', fontSize: '0.875rem' }}>
+                {error}
+              </div>
+            )}
+            {success && (
+              <div style={{ background: '#EDF3EC', border: '1px solid #EAEAEA', borderRadius: '8px', padding: '12px 16px', marginBottom: '16px', color: '#346538', fontSize: '0.875rem' }}>
+                {success}
+              </div>
+            )}
+
+            {/* Create User Form */}
+            {!showCreateForm ? (
+              <button
+                onClick={() => setShowCreateForm(true)}
+                style={{ background: '#111111', color: '#FFFFFF', border: 'none', padding: '10px 16px', borderRadius: '5px', cursor: 'pointer', fontSize: '0.875rem', fontWeight: 600, marginBottom: '24px' }}
+                onMouseEnter={(e) => e.currentTarget.style.background = '#2F3437'}
+                onMouseLeave={(e) => e.currentTarget.style.background = '#111111'}
+              >
+                + Create User
+              </button>
+            ) : (
+              <div style={{ background: '#FFFFFF', border: '1px solid #EAEAEA', borderRadius: '8px', padding: '20px', marginBottom: '24px' }}>
+                <h3 style={{ fontSize: '1.125rem', fontWeight: 600, marginBottom: '16px', color: '#111111' }}>Create New User</h3>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px' }}>
+                  <input
+                    type="text"
+                    placeholder="Username"
+                    value={newUser.username}
+                    onChange={(e) => setNewUser({ ...newUser, username: e.target.value })}
+                    style={{ padding: '10px 12px', border: '1px solid #EAEAEA', borderRadius: '5px', fontSize: '0.875rem', background: '#F7F6F3', color: '#111111' }}
+                  />
+                  <input
+                    type="password"
+                    placeholder="Password"
+                    value={newUser.password}
+                    onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
+                    style={{ padding: '10px 12px', border: '1px solid #EAEAEA', borderRadius: '5px', fontSize: '0.875rem', background: '#F7F6F3', color: '#111111' }}
+                  />
+                  <select
+                    value={newUser.role}
+                    onChange={(e) => setNewUser({ ...newUser, role: e.target.value })}
+                    style={{ padding: '10px 12px', border: '1px solid #EAEAEA', borderRadius: '5px', fontSize: '0.875rem', background: '#F7F6F3', color: '#111111', cursor: 'pointer' }}
+                  >
+                    <option value="developer">Developer</option>
+                    <option value="admin">Admin</option>
+                  </select>
+                </div>
+
+                {/* Project Selection */}
+                <div style={{ marginTop: '16px' }}>
+                  <label style={{ display: 'block', fontSize: '0.875rem', fontWeight: 600, marginBottom: '8px', color: '#111111' }}>
+                    Grant Project Access
+                  </label>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: '8px' }}>
+                    {projects.map(project => (
+                      <label key={project.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.875rem' }}>
+                        <input
+                          type="checkbox"
+                          checked={newUser.projectIds.includes(project.id)}
+                          onChange={(e) => {
+                            if (e.target.checked) {
+                              setNewUser({ ...newUser, projectIds: [...newUser.projectIds, project.id] });
+                            } else {
+                              setNewUser({ ...newUser, projectIds: newUser.projectIds.filter(id => id !== project.id) });
+                            }
+                          }}
+                          style={{ cursor: 'pointer' }}
+                        />
+                        <span>{project.name}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Buttons */}
+                <div style={{ display: 'flex', gap: '8px', marginTop: '16px' }}>
+                  <button
+                    onClick={handleCreateUser}
+                    style={{ background: '#EDF3EC', color: '#346538', border: 'none', padding: '10px 16px', borderRadius: '5px', cursor: 'pointer', fontSize: '0.875rem', fontWeight: 600 }}
+                  >
+                    Create
+                  </button>
+                  <button
+                    onClick={() => setShowCreateForm(false)}
+                    style={{ background: '#F7F6F3', color: '#111111', border: '1px solid #EAEAEA', padding: '10px 16px', borderRadius: '5px', cursor: 'pointer', fontSize: '0.875rem', fontWeight: 600 }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Users Table */}
+            {loading ? (
+              <p style={{ color: '#787774', fontSize: '0.875rem' }}>Loading users...</p>
+            ) : users.length === 0 ? (
+              <p style={{ color: '#787774', fontSize: '0.875rem' }}>No users found</p>
+            ) : (
+              <div style={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.875rem' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '2px solid #EAEAEA', background: '#F7F6F3' }}>
+                      <th style={{ padding: '12px', textAlign: 'left', fontWeight: 600, color: '#111111' }}>Username</th>
+                      <th style={{ padding: '12px', textAlign: 'left', fontWeight: 600, color: '#111111' }}>Role</th>
+                      <th style={{ padding: '12px', textAlign: 'left', fontWeight: 600, color: '#111111' }}>Projects</th>
+                      <th style={{ padding: '12px', textAlign: 'left', fontWeight: 600, color: '#111111' }}>Created</th>
+                      <th style={{ padding: '12px', textAlign: 'left', fontWeight: 600, color: '#111111' }}>Last Login</th>
+                      <th style={{ padding: '12px', textAlign: 'left', fontWeight: 600, color: '#111111' }}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {users.map((user, idx) => (
+                      <tr key={user.id} style={{ borderBottom: '1px solid #EAEAEA', background: idx % 2 === 0 ? '#FFFFFF' : '#FBFBFA' }}>
+                        <td style={{ padding: '12px', color: '#111111', fontWeight: 500 }}>{user.username}</td>
+                        <td style={{ padding: '12px', color: '#111111' }}>
+                          <span style={{ padding: '4px 8px', borderRadius: '4px', background: user.role === 'admin' ? '#E1F3FE' : '#EDF3EC', color: user.role === 'admin' ? '#1F6C9F' : '#346538', fontSize: '0.75rem', fontWeight: 600, textTransform: 'capitalize' }}>
+                            {user.role}
+                          </span>
+                        </td>
+                        <td style={{ padding: '12px', color: '#787774' }}>{user.project_count} project{user.project_count !== 1 ? 's' : ''}</td>
+                        <td style={{ padding: '12px', color: '#787774' }}>{formatDate(user.created_at)}</td>
+                        <td style={{ padding: '12px', color: '#787774' }}>{formatDate(user.last_login)}</td>
+                        <td style={{ padding: '12px', display: 'flex', gap: '4px' }}>
+                          {editingUserId === user.id ? (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', minWidth: '200px' }}>
+                              <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#111111' }}>Select projects:</div>
+                              <div style={{ display: 'grid', gap: '4px' }}>
+                                {projects.map(project => (
+                                  <label key={project.id} style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', fontSize: '0.75rem' }}>
+                                    <input
+                                      type="checkbox"
+                                      checked={editingProjects.includes(project.id)}
+                                      onChange={() => toggleProjectSelection(project.id)}
+                                      style={{ cursor: 'pointer' }}
+                                    />
+                                    <span>{project.name}</span>
+                                  </label>
+                                ))}
+                              </div>
+                              <div style={{ display: 'flex', gap: '4px' }}>
+                                <button
+                                  onClick={() => handleUpdateProjects(user.id)}
+                                  style={{ flex: 1, background: '#EDF3EC', color: '#346538', border: 'none', padding: '6px 8px', borderRadius: '3px', cursor: 'pointer', fontSize: '0.7rem', fontWeight: 600 }}
+                                >
+                                  Save
+                                </button>
+                                <button
+                                  onClick={() => setEditingUserId(null)}
+                                  style={{ flex: 1, background: '#F7F6F3', color: '#111111', border: '1px solid #EAEAEA', padding: '6px 8px', borderRadius: '3px', cursor: 'pointer', fontSize: '0.7rem' }}
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <>
+                              <button
+                                onClick={() => handleEditProjects(user.id)}
+                                style={{ background: '#F7F6F3', color: '#111111', border: '1px solid #EAEAEA', padding: '6px 10px', borderRadius: '3px', cursor: 'pointer', fontSize: '0.7rem', fontWeight: 600 }}
+                              >
+                                Edit
+                              </button>
+                              {user.id !== currentUserId && (
+                                <button
+                                  onClick={() => handleDeleteUser(user.id, user.username)}
+                                  style={{ background: '#FDEBEC', color: '#9F2F2D', border: '1px solid #EAEAEA', padding: '6px 10px', borderRadius: '3px', cursor: 'pointer', fontSize: '0.7rem', fontWeight: 600 }}
+                                >
+                                  Delete
+                                </button>
+                              )}
+                            </>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
     function App() {
       const [prompt, setPrompt] = useState('');
       const [sessionId, setSessionId] = useState(null);
@@ -1741,6 +2117,20 @@ function getIndexHtml() {
         }} />;
       }
 
+      // Show admin panel if in admin mode
+      if (viewMode === 'admin') {
+        return (
+          <AdminUsersPanel
+            projects={projects}
+            onClose={() => {
+              setViewMode('prompt');
+              setSelectedProjectId(null);
+            }}
+            currentUserId={currentUser?.userId}
+          />
+        );
+      }
+
       // Show execution kanban if a session is being executed
       if (sessionId) {
         return (
@@ -1790,6 +2180,17 @@ function getIndexHtml() {
               projectStatuses={projectStatuses}
             />
             <div style={{ flex: 1, minHeight: '100vh', background: '#FBFBFA', overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
+              <UserHeader
+                currentUser={currentUser}
+                onAdminClick={() => setViewMode('admin')}
+                onLogoutClick={async () => {
+                  await fetch('/api/auth/logout', { method: 'POST' });
+                  setIsAuthenticated(false);
+                  setCurrentUser(null);
+                  setPrompt('');
+                  setSessionId(null);
+                }}
+              />
               <div style={{ flex: 1, overflow: 'auto' }}>
                 <ProjectKanbanView
                   projectId={selectedProjectId}
@@ -1862,59 +2263,46 @@ function getIndexHtml() {
       }
 
       return (
-        <div style={{ display: 'flex', minHeight: '100vh', background: '#FBFBFA' }}>
-          <SessionSidebar
-            sessions={sessions}
-            projects={projects}
-            selectedProjectId={selectedProjectId}
-            activeSessionId={null}
-            onSessionClick={handleResumeSession}
-            onSessionRename={handleSessionRename}
-            onSessionDelete={handleSessionDelete}
-            onNewSession={handleNewSession}
-            isOpen={sidebarOpen}
-            onToggle={() => setSidebarOpen(!sidebarOpen)}
-            onProjectClick={handleProjectClick}
-            onProjectCreate={handleProjectCreate}
-            onProjectEdit={handleProjectEdit}
-            onProjectDelete={handleProjectDelete}
-            projectStatuses={projectStatuses}
+        <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh', background: '#FBFBFA' }}>
+          <UserHeader
+            currentUser={currentUser}
+            onAdminClick={() => setViewMode('admin')}
+            onLogoutClick={async () => {
+              await fetch('/api/auth/logout', { method: 'POST' });
+              setIsAuthenticated(false);
+              setCurrentUser(null);
+              setPrompt('');
+              setSessionId(null);
+            }}
           />
-          <div style={{ flex: 1, minHeight: '100vh', background: '#FBFBFA', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px', width: '100%' }}>
+          <div style={{ display: 'flex', flex: 1 }}>
+            <SessionSidebar
+              sessions={sessions}
+              projects={projects}
+              selectedProjectId={selectedProjectId}
+              activeSessionId={null}
+              onSessionClick={handleResumeSession}
+              onSessionRename={handleSessionRename}
+              onSessionDelete={handleSessionDelete}
+              onNewSession={handleNewSession}
+              isOpen={sidebarOpen}
+              onToggle={() => setSidebarOpen(!sidebarOpen)}
+              onProjectClick={handleProjectClick}
+              onProjectCreate={handleProjectCreate}
+              onProjectEdit={handleProjectEdit}
+              onProjectDelete={handleProjectDelete}
+              projectStatuses={projectStatuses}
+            />
+            <div style={{ flex: 1, minHeight: '100vh', background: '#FBFBFA', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px', width: '100%' }}>
           <div style={{ width: '100%', maxWidth: '640px' }}>
             <div style={{ background: '#FFFFFF', borderRadius: '8px', padding: '32px', border: '1px solid #EAEAEA' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', marginBottom: '24px' }}>
-                <div>
-                  <h1 style={{ fontSize: '2rem', fontWeight: 700, marginBottom: '12px', color: '#111111' }}>
-                    Claude Streaming
-                  </h1>
-                  <p style={{ fontSize: '0.875rem', color: '#787774', lineHeight: 1.6 }}>
-                    Real-time conversation interface with Kanban visualization of Claude CLI streaming mode.
-                  </p>
-                </div>
-                <div style={{ textAlign: 'right' }}>
-                  {currentUser && (
-                    <div style={{ marginBottom: '12px' }}>
-                      <p style={{ fontSize: '0.75rem', color: '#787774', margin: '0 0 4px 0' }}>Logged in as</p>
-                      <p style={{ fontSize: '0.875rem', fontWeight: 600, color: '#111111', margin: 0 }}>{currentUser.username}</p>
-                      <p style={{ fontSize: '0.7rem', color: '#787774', margin: '2px 0 0 0', textTransform: 'capitalize' }}>{currentUser.role}</p>
-                    </div>
-                  )}
-                  <button
-                    onClick={async () => {
-                      await fetch('/api/auth/logout', { method: 'POST' });
-                      setIsAuthenticated(false);
-                      setCurrentUser(null);
-                      setPrompt('');
-                      setSessionId(null);
-                    }}
-                    style={{ background: '#FDEBEC', color: '#9F2F2D', border: '1px solid #EAEAEA', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontSize: '0.75rem', fontWeight: 600 }}
-                    onMouseEnter={(e) => e.currentTarget.style.background = '#F9D5D7'}
-                    onMouseLeave={(e) => e.currentTarget.style.background = '#FDEBEC'}
-                  >
-                    Logout
-                  </button>
-                </div>
+              <div style={{ marginBottom: '24px' }}>
+                <h1 style={{ fontSize: '2rem', fontWeight: 700, marginBottom: '12px', color: '#111111' }}>
+                  Claude Streaming
+                </h1>
+                <p style={{ fontSize: '0.875rem', color: '#787774', lineHeight: 1.6 }}>
+                  Real-time conversation interface with Kanban visualization of Claude CLI streaming mode.
+                </p>
               </div>
 
               <div style={{ marginBottom: '20px' }}>
@@ -2010,6 +2398,7 @@ function getIndexHtml() {
             </div>
           </div>
         </div>
+          </div>
         </div>
       );
     }

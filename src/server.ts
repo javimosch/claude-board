@@ -58,158 +58,8 @@ const wsClients = new Map<string, Set<any>>();
 // Event parsing and Kanban conversion now imported from services/
 const converter = new KanbanConverter();
 
-// ============================================================================
-// Claude Executor
-// ============================================================================
-
-async function executeClaudeWithStreaming(
-  prompt: string,
-  sessionId: string,
-  permissionMode: 'plan' | 'execute' = 'execute',
-  model: string = 'sonnet',
-  projectId: string = 'default'
-) {
-  return new Promise<void>(async (resolve, reject) => {
-    const mode = permissionMode === 'plan' ? 'dontAsk' : 'bypassPermissions';
-
-    console.log(`[${sessionId}] ✨ Starting Claude execution`);
-    console.log(`[${sessionId}] Model: ${model}`);
-    console.log(`[${sessionId}] Project: ${projectId}`);
-    console.log(`[${sessionId}] Prompt: "${prompt.substring(0, 60)}..."`);
-
-    try {
-      // Get project to determine working directory
-      const project = getProject(projectId);
-      const workingDir = project?.cwd || process.cwd();
-      console.log(`[${sessionId}] Working directory: ${workingDir}`);
-
-      // Use Bun's native shell execution with cwd in environment
-      const command = `unset CLAUDECODE; cd "${workingDir.replace(/"/g, '\\"')}" && claude -p --model ${model} --verbose --output-format stream-json --permission-mode ${mode} "${prompt.replace(/"/g, '\\"')}"`;
-
-      const proc = Bun.spawn({
-        cmd: ['bash', '-c', command],
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-
-      let stdoutBuffer = '';
-      let stderrBuffer = '';
-
-      // Read stdout
-      (async () => {
-        const reader = proc.stdout.getReader();
-        const decoder = new TextDecoder();
-
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const chunk = decoder.decode(value, { stream: true });
-            stdoutBuffer += chunk;
-
-            // Process complete lines
-            const lines = stdoutBuffer.split('\n');
-            stdoutBuffer = lines.pop() || ''; // Keep incomplete line
-
-            for (const line of lines) {
-              if (!line.trim()) continue;
-
-              try {
-                const event = JSON.parse(line) as StreamEvent;
-                const session = sessions.get(sessionId);
-
-                if (!session) continue;
-
-                session.events.push(event);
-                console.log(`[${sessionId}] 📥 ${event.type}`);
-
-                const kanbanEvents = converter.convert(event, sessionId);
-                for (const ke of kanbanEvents) {
-                  broadcastToSession(sessionId, ke);
-
-                  // Store cards in session
-                  if (ke.type === 'card:add' && ke.card) {
-                    session.cards.set(ke.card.id, ke.card);
-                    console.log(`[${sessionId}] 📌 Card stored: ${ke.card.id}`);
-                  }
-
-                  if (ke.type === 'session:end' && ke.cost !== undefined) {
-                    session.totalCost += ke.cost;
-
-                    // Extract assistant response from result event
-                    if (event.type === 'result') {
-                      const resultEvent = event as any;
-                      const response = resultEvent.result || '';
-                      if (response) {
-                        // Add to conversation history for follow-ups
-                        session.conversationHistory.push(
-                          { role: 'user', content: prompt },
-                          { role: 'assistant', content: response }
-                        );
-                        console.log(`[${sessionId}] 💾 Conversation history updated`);
-                      }
-                    }
-                  }
-                }
-              } catch (e) {
-                console.error(`[${sessionId}] Parse error: ${e}`);
-              }
-            }
-          }
-        } catch (err) {
-          console.error(`[${sessionId}] stdout read error: ${err}`);
-        }
-      })();
-
-      // Read stderr
-      (async () => {
-        const reader = proc.stderr.getReader();
-        const decoder = new TextDecoder();
-
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const chunk = decoder.decode(value);
-            stderrBuffer += chunk;
-
-            if (chunk.includes('Error') || chunk.includes('error')) {
-              console.error(`[${sessionId}] stderr: ${chunk.substring(0, 100)}`);
-            }
-          }
-        } catch (err) {
-          console.error(`[${sessionId}] stderr read error: ${err}`);
-        }
-      })();
-
-      // Wait for process to complete
-      const exitCode = await proc.exited;
-      console.log(`[${sessionId}] ✨ Process exited with code ${exitCode}`);
-
-      // Update session status
-      const session = sessions.get(sessionId);
-      if (session) {
-        session.status = 'completed';
-        session.endTime = Date.now();
-
-        // Save full session to database
-        saveSessionToDb(sessionId, session);
-        console.log(`[${sessionId}] 💾 Session saved to database`);
-      }
-
-      resolve();
-    } catch (err) {
-      console.error(`[${sessionId}] ❌ Fatal error: ${err}`);
-      const session = sessions.get(sessionId);
-      if (session) {
-        session.status = 'error';
-      }
-      reject(err);
-    }
-  });
-}
+// Claude executor imported from services/claude.ts
+// Broadcaster function for WebSocket clients
 
 // ============================================================================
 // WebSocket & Broadcasting
@@ -233,11 +83,16 @@ function broadcastToSession(sessionId: string, event: KanbanEvent) {
 // Register Modular Routes
 // ============================================================================
 
+// Wrapper that provides converter and broadcaster to executeClaudeWithStreaming
+const executeWithContext = (prompt: string, sessionId: string, _sessions: any, _converter: any, _broadcaster: any, mode: string, model: string, projectId: string) => {
+  return executeClaudeWithStreaming(prompt, sessionId, sessions, converter, broadcastToSession, mode, model, projectId);
+};
+
 registerAuthRoutes(app);
-registerProjectRoutes(app, sessions, executeClaudeWithStreaming, getIndexHtml);
+registerProjectRoutes(app, sessions, executeWithContext, getIndexHtml);
 registerSessionRoutes(app, sessions);
 registerWebSocketRoute(app, sessions, wsClients);
-registerExecutionRoutes(app, sessions, wsClients, executeClaudeWithStreaming);
+registerExecutionRoutes(app, sessions, wsClients, executeWithContext);
 
 // ============================================================================
 // [DEPRECATED - Phase 4 Cleanup] OLD Endpoint Definitions Removed
